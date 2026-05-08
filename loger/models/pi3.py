@@ -579,21 +579,18 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             gate_scales,
         )
     
-    def forward(self, imgs, *args, **kwargs):
+    def forward(self, imgs, imgs_idx, *args, **kwargs):
+        """
+        Model's forward method. 
+        """
         # Windowing controls (optional)
         window_size = kwargs.pop('window_size', -1)
         overlap_size = kwargs.pop('overlap_size', 1)
         num_iterations = kwargs.pop('num_iterations', 1)
         no_detach = kwargs.pop('no_detach', False)
-        sim3 = kwargs.pop('sim3', False)
-        se3 = kwargs.pop('se3', False)
         reset_every = kwargs.pop('reset_every', 0)  # reset TTT / adapter state every N windows (0 disables)
         turn_off_ttt = kwargs.pop('turn_off_ttt', False)
         turn_off_swa = kwargs.pop('turn_off_swa', False)
-        sim3_scale_mode = kwargs.pop('sim3_scale_mode', 'median')
-
-        if sim3 and se3:
-            raise ValueError("'sim3' and 'se3' alignments are mutually exclusive; enable only one.")
 
         # Ensure at least one decode iteration so that 'hidden' is always defined
         try:
@@ -619,26 +616,9 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
         B, N, C, H, W = imgs.shape
         patch_h, patch_w = H // 14, W // 14
 
-        # --- Unified Windowed Inference ---
-        if window_size <= 0 or window_size >= N:
-            windows = [(0, N)]
-            eff_overlap = 0
-            eff_window_size = N
-        else:
-            windows = []
-            step = max(window_size - overlap_size, 1)
-            for start_idx in range(0, N, step):
-                end_idx = min(start_idx + window_size, N)
-                if end_idx - start_idx >= overlap_size or (end_idx == N and start_idx < N):
-                    windows.append((start_idx, end_idx))
-                if end_idx == N:
-                    break
-            eff_overlap = overlap_size
-            eff_window_size = window_size
-
         # Cache the effective window and overlap sizes for downstream merging utilities
-        self._last_window_size = eff_window_size
-        self._last_overlap_size = eff_overlap
+        self._last_window_size = window_size
+        self._last_overlap_size = overlap_size
 
         # Prepare TTT states across windows
         if self.ttt_layers is not None:
@@ -659,196 +639,167 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                 w1 = [None] * len(self.ttt_insert_after)
                 w2 = [None] * len(self.ttt_insert_after)
 
-        all_predictions = []
-        all_gate_scales: List[torch.Tensor] = []
-        all_attn_gate_scales: List[torch.Tensor] = []
-        
-        windows_iter = windows
-        for window_idx, (start_idx, end_idx) in enumerate(windows_iter):
-            if reset_every > 0 and window_idx > 0 and window_idx % reset_every == 0:
-                reset_adaptive_states()
-            imgs_w = imgs[:, start_idx:end_idx]  # (B, Nw, C, H, W)
-            imgs_w = imgs_w.to(self.image_mean.device)
-            imgs_w = (imgs_w - self.image_mean) / self.image_std
-            Nw = imgs_w.shape[1]
 
-            # Initialize to satisfy static analyzers; will be set inside decode loop
-            hidden = None  # type: ignore[assignment]
-            pos = None     # type: ignore[assignment]
+        if reset_every > 0 and imgs_idx > 0 and imgs_idx % reset_every == 0:
+            reset_adaptive_states()
 
-            for _ in range(num_iterations):
-                if self.ttt_layers is not None and w0 is None:
-                    w0 = [None] * len(self.ttt_insert_after)
-                    w1 = [None] * len(self.ttt_insert_after)
-                    w2 = [None] * len(self.ttt_insert_after)
+        imgs_w = imgs  # (B, Nw, C, H, W)
 
-                if self.swa_layers is not None and swa_history is None:
-                    swa_history = [None] * len(self.attn_insert_after)
+        imgs_w = imgs_w.to(self.image_mean.device)
+        imgs_w = (imgs_w - self.image_mean) / self.image_std
+        Nw = imgs_w.shape[1]
 
-                imgs_flat = imgs_w.reshape(B * Nw, C, H, W)
-                hidden_input = self.encoder(imgs_flat, is_training=True)
-                if isinstance(hidden_input, dict):
-                    hidden_input = hidden_input["x_norm_patchtokens"]
+        # Initialize to satisfy static analyzers; will be set inside decode loop
+        hidden = None  # type: ignore[assignment]
+        pos = None     # type: ignore[assignment]
 
-                # Prepare adapter control dictionaries for decode
-                ttt_state = None
-                attn_state = None
+        for _ in range(num_iterations):
+            if self.ttt_layers is not None and w0 is None:
+                w0 = [None] * len(self.ttt_insert_after)
+                w1 = [None] * len(self.ttt_insert_after)
+                w2 = [None] * len(self.ttt_insert_after)
 
-                if self.ttt_layers is not None:
-                    ttt_state = {
-                        "ttt_op_order": self.ttt_op_order if self.ttt_op_order is not None else [],
-                        "insert_after": self.ttt_insert_after,
-                        "w0": w0,
-                        "w1": w1,
-                        "w2": w2,
-                    }
+            if self.swa_layers is not None and swa_history is None:
+                swa_history = [None] * len(self.attn_insert_after)
 
-                if self.swa_layers is not None:
-                    attn_state = {
-                        "insert_after": self.attn_insert_after,
-                        "history": swa_history,
-                    }
+            imgs_flat = imgs_w.reshape(B * Nw, C, H, W)
+            hidden_input = self.encoder(imgs_flat, is_training=True)
+            if isinstance(hidden_input, dict):
+                hidden_input = hidden_input["x_norm_patchtokens"]
 
-                if ttt_state is None and attn_state is None:
-                    ttt_dict = None
-                else:
-                    ttt_dict = {
-                        "ttt": ttt_state,
-                        "attn": attn_state,
-                    }
-                hidden, pos, ttt_output_info, decode_avg_gate_scale, decode_avg_attn_gate_scale, _decode_gate_scales = self.decode(
-                    hidden_input, Nw, H, W,
-                    ttt_dict=ttt_dict,
-                    window_size=window_size,
-                    overlap_size=overlap_size,
-                    is_first_window=(start_idx == 0),
-                    turn_off_ttt=turn_off_ttt,
-                    turn_off_swa=turn_off_swa,
-                )
-                if decode_avg_gate_scale is not None:
-                    all_gate_scales.append(decode_avg_gate_scale.detach().cpu())
-                if decode_avg_attn_gate_scale is not None:
-                    all_attn_gate_scales.append(decode_avg_attn_gate_scale.detach().cpu())
+            # Prepare adapter control dictionaries for decode
+            ttt_state = None
+            attn_state = None
 
-                # TODO: get the updated state from the ttt layer
-                if self.ttt_layers is not None and ttt_output_info is not None:
-                    w0, w1, w2 = ttt_output_info["w0"], ttt_output_info["w1"], ttt_output_info["w2"]
-                
-                # TODO: get the updated history from the swa layer
-                if ttt_output_info is not None:
-                    swa_history = ttt_output_info.get("history", swa_history)
+            if self.ttt_layers is not None:
+                ttt_state = {
+                    "ttt_op_order": self.ttt_op_order if self.ttt_op_order is not None else [],
+                    "insert_after": self.ttt_insert_after,
+                    "w0": w0,
+                    "w1": w1,
+                    "w2": w2,
+                }
 
-            # If for some reason decoding didn't produce hidden (e.g., empty window), skip this window
-            if hidden is None:
-                continue
+            if self.swa_layers is not None:
+                attn_state = {
+                    "insert_after": self.attn_insert_after,
+                    "history": swa_history,
+                }
 
-            point_hidden = self.point_decoder(hidden, xpos=pos)
-            if self.use_conf and self.conf_decoder is not None:
-                conf_hidden = self.conf_decoder(hidden, xpos=pos)
+            if ttt_state is None and attn_state is None:
+                ttt_dict = None
             else:
-                conf_hidden = None
+                ttt_dict = {
+                    "ttt": ttt_state,
+                    "attn": attn_state,
+                }
+            hidden, pos, ttt_output_info, decode_avg_gate_scale, decode_avg_attn_gate_scale, _decode_gate_scales = self.decode(
+                hidden_input, Nw, H, W,
+                ttt_dict=ttt_dict,
+                window_size=window_size,
+                overlap_size=overlap_size,
+                is_first_window=(imgs_idx == 0),
+                turn_off_ttt=turn_off_ttt,
+                turn_off_swa=turn_off_swa,
+            )
+            if decode_avg_gate_scale is not None:
+                decode_avg_gate_scale = decode_avg_gate_scale.detach().cpu()
+            if decode_avg_attn_gate_scale is not None:
+                decode_avg_attn_gate_scale = decode_avg_attn_gate_scale.detach().cpu()
+
+            # TODO: get the updated state from the ttt layer
+            if self.ttt_layers is not None and ttt_output_info is not None:
+                w0, w1, w2 = ttt_output_info["w0"], ttt_output_info["w1"], ttt_output_info["w2"]
             
-            if self.pi3x and self.pi3x_metric:
-                hw = hidden.shape[1]
-                pos_hw = pos.reshape(B, Nw*hw, -1)
-                metric_hidden = self.metric_decoder(self.metric_token.repeat(B, 1, 1), hidden.reshape(B, Nw*hw, -1), xpos=pos_hw[:, 0:1], ypos=pos_hw)
-            else:
-                metric_hidden = None
+            # TODO: get the updated history from the swa layer
+            if ttt_output_info is not None:
+                swa_history = ttt_output_info.get("history", swa_history)
 
-            camera_hidden = self.camera_decoder(hidden, xpos=pos)
+        # If for some reason decoding didn't produce hidden (e.g., empty window), skip this window
+        if hidden is None:
+            return None, None, None
 
-            global_camera_hidden = camera_hidden
-
-            with torch.autocast(device_type='cuda', enabled=False):
-                # local points
-                point_hidden = point_hidden.float()
-                if self.pi3x:
-                    xy, z = self.point_head(point_hidden[:, self.patch_start_idx:], patch_h=patch_h, patch_w=patch_w)
-                    xy = xy.permute(0, 2, 3, 1).reshape(B, Nw, H, W, -1)
-                    z = z.permute(0, 2, 3, 1).reshape(B, Nw, H, W, -1)
-                    z = torch.exp(z.clamp(max=15.0))
-                    local_points = torch.cat([xy * z, z], dim=-1)
-                else:
-                    ret = self.point_head([point_hidden[:, self.patch_start_idx:]], (H, W)).reshape(B, Nw, H, W, -1)
-                    xy, z = ret.split([2, 1], dim=-1)
-                    z = torch.exp(z)
-                    local_points = torch.cat([xy * z, z], dim=-1)
-
-                # confidence
-                if conf_hidden is not None and self.conf_head is not None:
-                    conf_hidden = conf_hidden.float()
-                    conf = self.conf_head([conf_hidden[:, self.patch_start_idx:]], (H, W)).reshape(B, Nw, H, W, -1)
-                else:
-                    conf = None
-
-                # camera
-                global_camera_hidden = global_camera_hidden.float()
-                camera_poses = self.camera_head(global_camera_hidden[:, self.patch_start_idx:], patch_h, patch_w).reshape(B, Nw, 4, 4)
-                camera_qvec = None
-                local_camera_poses = None
-                local_camera_qvec = None
-
-                # metric
-                if self.pi3x and self.pi3x_metric and metric_hidden is not None:
-                    metric = self.metric_head(metric_hidden.float()).reshape(B).exp()
-                    
-                    # apply metric to points and camera poses
-                    # points = torch.einsum('bnij, bnhwj -> bnhwi', camera_poses, homogenize_points(local_points))[..., :3] * metric.view(B, 1, 1, 1, 1)
-                    camera_poses[..., :3, 3] = camera_poses[..., :3, 3] * metric.view(B, 1, 1)
-                    local_points = local_points * metric.view(B, 1, 1, 1, 1)
-                    if local_camera_poses is not None:
-                        local_camera_poses[..., :3, 3] = local_camera_poses[..., :3, 3] * metric.view(B, 1, 1)
-                else:
-                    metric = None
-
-
-            # unproject local points using camera poses
-            with torch.autocast(device_type='cuda', enabled=False):
-                points = torch.einsum('bnij, bnhwj -> bnhwi', camera_poses, homogenize_points(local_points))[..., :3]
-
-
-            def maybe_detach(t, no_detach=no_detach):
-                if t is None:
-                    return None
-                return t if self.training or no_detach else t.detach().cpu()
-
-            pred_dict = dict(
-                points=maybe_detach(points, no_detach=no_detach),
-                local_points=maybe_detach(local_points, no_detach=no_detach),
-                conf=maybe_detach(conf, no_detach=no_detach),
-                camera_poses=maybe_detach(camera_poses, no_detach=no_detach),
-                local_camera_poses=maybe_detach(local_camera_poses, no_detach=no_detach),
-                camera_qvec=maybe_detach(camera_qvec, no_detach=no_detach),
-                local_camera_qvec=maybe_detach(local_camera_qvec, no_detach=no_detach),
-                metric=maybe_detach(metric, no_detach=no_detach),
-            )
-            all_predictions.append(pred_dict)
-
-        # Merge windowed predictions
-        # When reset is enabled but explicit Sim3/SE3 alignment is off, keep each reset block
-        # in a stable rigid frame by applying one estimated transform per block.
-        align_on_resets_without_explicit_pose = reset_every > 0 and not sim3 and not se3
-        if sim3:
-            merged = self._merge_windowed_predictions_sim3(
-                all_predictions, 
-                allow_scale=True, 
-                scale_mode=sim3_scale_mode,
-            )
-        elif se3 or align_on_resets_without_explicit_pose:
-            merged = self._merge_windowed_predictions_sim3(
-                all_predictions, 
-                allow_scale=False,
-                reset_every=reset_every,
-                reuse_transform_within_reset_block=align_on_resets_without_explicit_pose,
-            )
+        point_hidden = self.point_decoder(hidden, xpos=pos)
+        if self.use_conf and self.conf_decoder is not None:
+            conf_hidden = self.conf_decoder(hidden, xpos=pos)
         else:
-            merged = self._merge_windowed_predictions(all_predictions, eff_window_size, eff_overlap)
-        if all_gate_scales:
-            merged["avg_gate_scale"] = torch.stack(all_gate_scales).mean()
-        if all_attn_gate_scales:
-            merged["attn_gate_scale"] = torch.stack(all_attn_gate_scales).mean()
+            conf_hidden = None
         
-        return merged
+        if self.pi3x and self.pi3x_metric:
+            hw = hidden.shape[1]
+            pos_hw = pos.reshape(B, Nw*hw, -1)
+            metric_hidden = self.metric_decoder(self.metric_token.repeat(B, 1, 1), hidden.reshape(B, Nw*hw, -1), xpos=pos_hw[:, 0:1], ypos=pos_hw)
+        else:
+            metric_hidden = None
+
+        camera_hidden = self.camera_decoder(hidden, xpos=pos)
+
+        global_camera_hidden = camera_hidden
+
+        with torch.autocast(device_type='cuda', enabled=False):
+            # local points
+            point_hidden = point_hidden.float()
+            if self.pi3x:
+                xy, z = self.point_head(point_hidden[:, self.patch_start_idx:], patch_h=patch_h, patch_w=patch_w)
+                xy = xy.permute(0, 2, 3, 1).reshape(B, Nw, H, W, -1)
+                z = z.permute(0, 2, 3, 1).reshape(B, Nw, H, W, -1)
+                z = torch.exp(z.clamp(max=15.0))
+                local_points = torch.cat([xy * z, z], dim=-1)
+            else:
+                ret = self.point_head([point_hidden[:, self.patch_start_idx:]], (H, W)).reshape(B, Nw, H, W, -1)
+                xy, z = ret.split([2, 1], dim=-1)
+                z = torch.exp(z)
+                local_points = torch.cat([xy * z, z], dim=-1)
+
+            # confidence
+            if conf_hidden is not None and self.conf_head is not None:
+                conf_hidden = conf_hidden.float()
+                conf = self.conf_head([conf_hidden[:, self.patch_start_idx:]], (H, W)).reshape(B, Nw, H, W, -1)
+            else:
+                conf = None
+
+            # camera
+            global_camera_hidden = global_camera_hidden.float()
+            camera_poses = self.camera_head(global_camera_hidden[:, self.patch_start_idx:], patch_h, patch_w).reshape(B, Nw, 4, 4)
+            camera_qvec = None
+            local_camera_poses = None
+            local_camera_qvec = None
+
+            # metric
+            if self.pi3x and self.pi3x_metric and metric_hidden is not None:
+                metric = self.metric_head(metric_hidden.float()).reshape(B).exp()
+                
+                # apply metric to points and camera poses
+                # points = torch.einsum('bnij, bnhwj -> bnhwi', camera_poses, homogenize_points(local_points))[..., :3] * metric.view(B, 1, 1, 1, 1)
+                camera_poses[..., :3, 3] = camera_poses[..., :3, 3] * metric.view(B, 1, 1)
+                local_points = local_points * metric.view(B, 1, 1, 1, 1)
+                if local_camera_poses is not None:
+                    local_camera_poses[..., :3, 3] = local_camera_poses[..., :3, 3] * metric.view(B, 1, 1)
+            else:
+                metric = None
+
+        # unproject local points using camera poses
+        with torch.autocast(device_type='cuda', enabled=False):
+            points = torch.einsum('bnij, bnhwj -> bnhwi', camera_poses, homogenize_points(local_points))[..., :3]
+
+        def maybe_detach(t, no_detach=no_detach):
+            if t is None:
+                return None
+            return t if self.training or no_detach else t.detach().cpu()
+
+        pred_dict = dict(
+            points=maybe_detach(points, no_detach=no_detach),
+            local_points=maybe_detach(local_points, no_detach=no_detach),
+            conf=maybe_detach(conf, no_detach=no_detach),
+            camera_poses=maybe_detach(camera_poses, no_detach=no_detach),
+            local_camera_poses=maybe_detach(local_camera_poses, no_detach=no_detach),
+            camera_qvec=maybe_detach(camera_qvec, no_detach=no_detach),
+            local_camera_qvec=maybe_detach(local_camera_qvec, no_detach=no_detach),
+            metric=maybe_detach(metric, no_detach=no_detach),
+        )
+
+        # NOTE: Fix return
+        return pred_dict, decode_avg_gate_scale, decode_avg_attn_gate_scale
 
     def _merge_windowed_predictions(self, all_predictions, window_size, overlap_size):
         """
