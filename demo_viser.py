@@ -19,6 +19,7 @@ from pathlib import Path
 from loger.utils.rotation import mat_to_quat
 from loger.utils.geometry import depth_edge
 from loger.models.pi3 import Pi3
+from loger.dataset import ImageWindowIterableDataset 
 from loger.utils.viser_utils import viser_wrapper
 
 
@@ -362,6 +363,9 @@ def write_trajectory_txt(output_path: Path, timestamps, translations, quaternion
 
 
 def load_images_from_paths(image_paths, PIXEL_LIMIT=255000, Target_W=None, Target_H=None, verbose=True):
+    """
+    Load images from paths as tensors.
+    """
     sources = []
     for img_path in image_paths:
         try:
@@ -404,6 +408,7 @@ def load_images_from_paths(image_paths, PIXEL_LIMIT=255000, Target_W=None, Targe
         return torch.empty(0)
 
     return torch.stack(tensor_list, dim=0)
+
 
 def main():
     args = parser.parse_args()
@@ -498,23 +503,11 @@ def main():
         if not all_image_names_collected:
             print("No images to process. Exiting.")
             return
-            
+
         print(f"Found {len(all_image_names_collected)} images to process.")
-        if target_resolution is not None:
-            images_tensor = load_images_from_paths(all_image_names_collected, Target_W=target_resolution[0], Target_H=target_resolution[1]).to(device)
-        else:
-            images_tensor = load_images_from_paths(all_image_names_collected).to(device)
-        
         image_folder_for_sky = os.path.dirname(all_image_names_collected[0]) if all_image_names_collected else None
 
-        if images_tensor.numel() == 0:
-            print("Error: No images were loaded successfully. Check image paths and formats.")
-            return
-
-        print("Running inference...")
-        dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.get_device_capability(device)[0] >= 8 else torch.float16
-        num_frames = images_tensor.shape[0]
-        
+        # Load kwargs
         forward_kwargs = {}
         if args.config:
             try:
@@ -554,16 +547,46 @@ def main():
                 'reset_every': args.reset_every if args.reset_every is not None else 0
             })
 
+        if sim3 and se3:
+            raise ValueError("'sim3' and 'se3' alignments are mutually exclusive; enable only one.")
+
+        window_size, overlap_size = forward_kwargs["window_size"], forward_kwargs["overlap_size"]
+
+        target_w, target_h = None, None if target_resolution is None else target_resolution
+
+        img_iter_dataset = ImageWindowIterableDataset(
+            paths=all_image_names_collected, 
+            window_size=window_size, 
+            overlap_size=overlap_size, 
+            target_w=target_w, 
+            target_h=target_h,
+        )
+
+        num_frames = img_iter_dataset.N
+
+        if num_frames == 0:
+            print("Error: No images were loaded successfully. Check image paths and formats.")
+            return
+
+        img_tensor_loader = torch.utils.data.DataLoader(
+            img_iter_dataset, batch_size=None, batch_sampler=None, num_workers=4
+        )
+
+        print("Running inference...")
+        dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.get_device_capability(device)[0] >= 8 else torch.float16
+
         # Warmup run to trigger torch.compile (first run has compilation overhead)
         if args.warmup or args.benchmark:
             print("Running warmup inference (to trigger torch.compile)...")
             with torch.no_grad(), torch.cuda.amp.autocast(enabled=torch.cuda.is_available(), dtype=dtype):
-                _ = model(images_tensor[None], **forward_kwargs)
+                for img_idx, img_tensor in enumerate(img_tensor_loader):
+                    _ = model(img_tensor[None], img_idx, **forward_kwargs)
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
             print("Warmup complete.")
 
         # Benchmark mode: run multiple times and report statistics
+        # NOTE: Not supported for now
         if args.benchmark:
             num_runs = 3
             print(f"\nRunning benchmark with {num_runs} inference passes...")
@@ -600,9 +623,60 @@ def main():
                 torch.cuda.synchronize()
             inference_start_time = time.time()
             
+            # Merge predicitions outside model
             with torch.no_grad(), torch.cuda.amp.autocast(enabled=torch.cuda.is_available(), dtype=dtype):
-                raw_model_predictions = model(images_tensor[None], **forward_kwargs) # Add batch dimension
 
+                all_predictions, all_gate_scales, all_attn_gate_scales  = [], [], []
+
+                for img_idx, img_tensor in enumerate(img_tensor_loader):
+
+                    pred_dict, decode_avg_gate_scale, decode_avg_attn_gate_scale = model(
+                        img_tensor[None], img_idx, **forward_kwargs
+                    )
+
+                    if pred_dict is None:
+                        continue
+
+                    all_predictions.append(pred_dict)
+                    all_gate_scales.append(decode_avg_gate_scale)
+                    all_attn_gate_scales.append(decode_avg_attn_gate_scale)
+
+                # Mergin is moved outside the forward step where all predictions are gathered
+                sim3 = forward_kwargs.pop('sim3', False)
+                se3 = forward_kwargs.pop('se3', False)
+                sim3_scale_mode = forward_kwargs.pop('sim3_scale_mode', 'median')
+                reset_every = forward_kwargs.pop('reset_every', 0)
+                eff_window_size = img_iter_dataset.window_size
+                eff_overlap = img_iter_dataset.overlap_size
+
+                # Merge windowed predictions
+                # When reset is enabled but explicit Sim3/SE3 alignment is off, keep each reset block
+                # in a stable rigid frame by applying one estimated transform per block.
+                align_on_resets_without_explicit_pose = reset_every > 0 and not sim3 and not se3
+
+                if sim3:
+                    merged = model._merge_windowed_predictions_sim3(
+                        all_predictions, 
+                        allow_scale=True, 
+                        scale_mode=sim3_scale_mode,
+                    )
+                elif se3 or align_on_resets_without_explicit_pose:
+                    merged = model._merge_windowed_predictions_sim3(
+                        all_predictions, 
+                        allow_scale=False,
+                        reset_every=reset_every,
+                        reuse_transform_within_reset_block=align_on_resets_without_explicit_pose,
+                    )
+                else:
+                    merged = model._merge_windowed_predictions(all_predictions, eff_window_size, eff_overlap)
+                if all_gate_scales:
+                    merged["avg_gate_scale"] = torch.stack(all_gate_scales).mean()
+                if all_attn_gate_scales:
+                    merged["attn_gate_scale"] = torch.stack(all_attn_gate_scales).mean()
+
+            raw_model_predictions = merged
+
+            # Continue from previous step
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
             inference_end_time = time.time()
@@ -623,7 +697,9 @@ def main():
 
         # Post-process predictions
         # Using permute to get (B, S, H, W, C) for easier numpy conversion later
-        raw_model_predictions['images'] = images_tensor[None].permute(0, 1, 3, 4, 2) 
+        # NOTE: No need to permute since the images are loaded as np arrays
+        # NOTE: No need to add `B` dimension as it was removed afterwards
+        raw_model_predictions['images'] = img_iter_dataset.load_all_images_as_np_array()
         raw_model_predictions['conf'] = torch.sigmoid(raw_model_predictions['conf'])
         # Edge mask on depth can be noisy, optional
         # edge = depth_edge(raw_model_predictions['local_points'][..., 2], rtol=0.03)
