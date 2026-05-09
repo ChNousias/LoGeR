@@ -547,6 +547,9 @@ def main():
                 'reset_every': args.reset_every if args.reset_every is not None else 0
             })
 
+        sim3 = forward_kwargs.get('sim3', False)
+        se3 = forward_kwargs.get('se3', False)
+
         if sim3 and se3:
             raise ValueError("'sim3' and 'se3' alignments are mutually exclusive; enable only one.")
 
@@ -642,10 +645,10 @@ def main():
                     all_attn_gate_scales.append(decode_avg_attn_gate_scale)
 
                 # Mergin is moved outside the forward step where all predictions are gathered
-                sim3 = forward_kwargs.pop('sim3', False)
-                se3 = forward_kwargs.pop('se3', False)
-                sim3_scale_mode = forward_kwargs.pop('sim3_scale_mode', 'median')
-                reset_every = forward_kwargs.pop('reset_every', 0)
+                sim3 = forward_kwargs.get('sim3', False)
+                se3 = forward_kwargs.get('se3', False)
+                sim3_scale_mode = forward_kwargs.get('sim3_scale_mode', 'median')
+                reset_every = forward_kwargs.get('reset_every', 0)
                 eff_window_size = img_iter_dataset.window_size
                 eff_overlap = img_iter_dataset.overlap_size
 
