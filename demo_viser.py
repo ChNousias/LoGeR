@@ -699,10 +699,6 @@ def main():
             print(f"{'='*50}\n")
 
         # Post-process predictions
-        # Using permute to get (B, S, H, W, C) for easier numpy conversion later
-        # NOTE: No need to permute since the images are loaded as np arrays
-        # NOTE: No need to add `B` dimension as it was removed afterwards
-        raw_model_predictions['images'] = img_iter_dataset.load_all_images_as_np_array()
         raw_model_predictions['conf'] = torch.sigmoid(raw_model_predictions['conf'])
         # Edge mask on depth can be noisy, optional
         # edge = depth_edge(raw_model_predictions['local_points'][..., 2], rtol=0.03)
@@ -715,6 +711,9 @@ def main():
         predictions_dict = {k: v.squeeze(0).cpu().float().numpy() 
                            for k, v in raw_model_predictions.items() 
                            if v is not None and torch.is_tensor(v)}
+        # NOTE: No need to permute since the images are loaded as np arrays
+        # NOTE: No need to add `B` dimension as it was removed afterwards
+        predictions_dict["images"] = img_iter_dataset.load_all_images_as_np_array()
 
         if args.output_folder:
             os.makedirs(args.output_folder, exist_ok=True)
