@@ -7,7 +7,7 @@ import numpy as np
 from PIL import Image
 from torchvision import transforms
 
-from torch.utils.data import IterableDataset
+from torch.utils.data import IterableDataset, get_worker_info
 
 
 def estimate_resize(
@@ -221,20 +221,43 @@ class ImageWindowIterableDataset(IterableDataset):
         except IndexError:
             print("No valid image frames are given.")
 
-    def create_stream(self, paths: List[str]) -> Iterator[torch.tensor]:
+    def init_img_path_stream(self, paths: List[str]) -> Iterator[torch.tensor]:
         """
         Create image stream.
         """
         for s_idx, e_idx in self.windows:
+            yield paths[s_idx:e_idx]
 
-            imgs = load_images_from_paths(paths[s_idx:e_idx])
+    def img_path_processor(self, paths: List[str]) -> torch.Tensor:
+        """
+        Preprocess operation of a list of image paths.
+        """
+        imgs = load_images_from_paths(paths)
 
-            tensors = pil_images_to_tensors(imgs, self.target_w, self.target_h)
-
-            yield tensors
+        return pil_images_to_tensors(imgs, self.target_w, self.target_h)
 
     def __iter__(self):
-        return self.create_stream(self.paths)
+        """ """
+        worker_info = get_worker_info()
+        img_path_iterator = self.init_img_path_stream(self.paths)
+
+        if worker_info is None:
+            worker_id = 0
+            num_workers = 1
+        else:
+            worker_id = worker_info.id
+            num_workers = worker_info.num_workers
+
+        # Basic worker sharding: each worker processes every Nth record
+        sharded_iterator = (
+            record
+            for i, record in enumerate(img_path_iterator)
+            if i % num_workers == worker_id
+        )
+
+        # Apply processing within the worker's iterator chain
+        processed_iterator = map(self.img_path_processor, sharded_iterator)
+        return processed_iterator
 
     def __len__(self):
         # This refers to the length of the iterator, not the image paths.
